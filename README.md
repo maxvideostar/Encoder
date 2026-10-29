@@ -33,7 +33,8 @@ Re-rularea scriptului actualizează panoul; la întrebarea de utilizator apasă 
 - Start / Stop / Restart, activare la boot, log live cu fps / bitrate / speed.
 - Editare script, `.env` și unit systemd, cu backup automat (`/var/lib/encpanel/backups`) și verificare sintaxă bash.
 - „Fă serviciu”: transformă un script simplu în serviciu systemd cu restart automat.
-- CPU / RAM / rețea / temperatură / NVENC (Nvidia), procese ffmpeg rătăcite cu buton de oprire.
+- CPU / RAM / rețea / temperatură / NVENC (Nvidia).
+- „Alte procese ffmpeg”: orice ffmpeg pornit manual, din cron sau din scripturi din alte foldere, cu comanda completă. Butonul **„Salvează ca serviciu”** creează `enc-NUME.service` cu exact acea comandă (restart automat + pornire la boot), oprește procesul vechi (și scriptul-buclă care îl pornea) și pornește serviciul. Dacă procesul aparține deja unui serviciu nedetectat, butonul îl adaugă în panou.
 - Securitate: parole hash PBKDF2, blocare 15 min după 5 încercări greșite, CSRF, cookie-uri Secure/HttpOnly, jurnal acțiuni.
 - Repornirea panoului nu oprește encoderele.
 

@@ -699,7 +699,15 @@ def build_state():
     for it in items:
         it['cpu'] = round(sum(f['cpu'] for f in it['ff']), 1)
         it['rss'] = sum(f['rss'] for f in it['ff'])
-    orphans = [dict(ff_item(p, cpu), unit=unit_of[pid]) for pid, p in ffs.items() if pid not in claimed]
+    orphans = []
+    for pid, p in ffs.items():
+        if pid in claimed:
+            continue
+        o = dict(ff_item(p, cpu), unit=unit_of[pid] if unit_of[pid] != SELF_UNIT else None)
+        par = loop_parent(pid, procs)
+        o['parent'] = ' '.join(procs[par]['argv'])[:300] if par else ''
+        o['suggest'] = suggest_name(p)
+        orphans.append(o)
     return dict(items=items, orphans=orphans, sys=SAMPLE['sys'], disc_age=int(time.time() - d['ts']))
 
 
@@ -737,6 +745,103 @@ def find_item(kind, iid):
         if it['id'] == iid:
             return it
     return None
+
+
+SHELLS = ('bash', 'sh', 'dash', 'zsh', 'ash')
+
+
+def loop_parent(pid, procs):
+    """Dacă ffmpeg e pornit de un script (buclă while), returnează pid-ul scriptului."""
+    pp = procs.get(pid, {}).get('ppid')
+    par = procs.get(pp)
+    if not par or pp <= 1 or par['comm'] not in SHELLS:
+        return None
+    a = [x for x in par['argv'][1:] if not x.startswith('-')]
+    if a and a[0] != '-c' and os.path.isfile(a[0] if a[0].startswith('/') else os.path.join(_cwd(pp), a[0])):
+        return pp
+    return None
+
+
+def _cwd(pid):
+    try:
+        return os.readlink('/proc/%d/cwd' % pid)
+    except OSError:
+        return '/'
+
+
+def suggest_name(p):
+    _, out, _ = ff_summary(p)
+    base = re.sub(r'\?.*$', '', out.rstrip('/')).rsplit('/', 1)[-1]
+    base = re.sub(r'\.(m3u8|ts|flv|mp4|mkv)$', '', base)
+    base = re.sub(r'[^A-Za-z0-9_-]', '-', base).strip('-')[:40]
+    return base or 'encoder-%d' % p['pid']
+
+
+def sd_quote(a):
+    """Quoting pentru ExecStart= (fără expandare $ sau specificatori %)."""
+    a = a.replace('%', '%%').replace('$', '$$')
+    if re.match(r'^[A-Za-z0-9_@%+=:,./$-]+$', a):
+        return a
+    return '"' + a.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def autostart_hints():
+    hits = []
+    for f in ['/etc/rc.local', '/etc/crontab'] + [os.path.join('/etc/cron.d', x) for x in (os.listdir('/etc/cron.d') if os.path.isdir('/etc/cron.d') else [])]:
+        t = read_text(f) or ''
+        if 'ffmpeg' in t or '.sh' in t:
+            hits.append(f)
+    rc, o = sh(['crontab', '-l'], 5)
+    if rc == 0 and ('ffmpeg' in o or '.sh' in o) and '@reboot' in o:
+        hits.append('crontab root (@reboot)')
+    return hits
+
+
+def adopt_ffmpeg(pid, name):
+    procs = read_procs()
+    p = procs.get(pid)
+    if not p or not is_ffmpeg(p):
+        return None, 'Procesul nu mai există sau nu e ffmpeg'
+    if not re.match(r'^[A-Za-z0-9_-]{1,50}$', name or ''):
+        return None, 'Nume invalid (doar litere, cifre, - și _)'
+    uname = 'enc-%s.service' % name
+    upath = '/etc/systemd/system/' + uname
+    if os.path.exists(upath):
+        return None, 'Există deja ' + uname
+    argv = list(p['argv'])
+    try:
+        exe = os.readlink('/proc/%d/exe' % pid)
+        if os.path.isfile(exe):
+            argv[0] = exe
+    except OSError:
+        pass
+    if not argv[0].startswith('/'):
+        argv[0] = shutil.which(argv[0]) or '/usr/bin/ffmpeg'
+    cwd = _cwd(pid)
+    par = loop_parent(pid, procs)
+    unit = ('[Unit]\nDescription=Encoder %s (preluat din procesul ffmpeg %d)\nAfter=network-online.target\nWants=network-online.target\n\n'
+            '[Service]\nType=simple\nWorkingDirectory=%s\nExecStart=%s\nRestart=always\nRestartSec=5\nTimeoutStopSec=15\n\n'
+            '[Install]\nWantedBy=multi-user.target\n') % (name, pid, cwd, ' '.join(sd_quote(a) for a in argv))
+    with open(upath, 'w') as f:
+        f.write(unit)
+    sh(['systemctl', 'daemon-reload'])
+    rc, o = sh(['systemd-analyze', 'verify', upath], 20)
+    if rc and 'ExecStart' in o:
+        os.unlink(upath)
+        sh(['systemctl', 'daemon-reload'])
+        return None, 'Unit invalid, nu am schimbat nimic:\n' + o[-500:]
+    kill_tree([par] if par else [pid])
+    rc, o = sh(['systemctl', 'enable', '--now', uname], 60)
+    if rc:
+        return None, 'Serviciul nu a pornit (procesul vechi a fost oprit!):\n' + o[-500:]
+    msg = 'Creat %s, pornește automat la boot.' % uname
+    if par:
+        msg += ' Am oprit și scriptul-buclă care îl pornea.'
+    h = autostart_hints()
+    if h:
+        msg += '\nAtenție: verifică dacă vechea comandă pornește și din %s, ca să nu ruleze dublu după restart.' % ', '.join(h)
+    discover(True)
+    return msg, None
 
 
 def kill_tree(roots, wait=6):
@@ -788,6 +893,23 @@ def api_action():
             pid = int(iid)
         except ValueError:
             return jsonify(error='pid invalid'), 400
+        if op == 'adopt':
+            msg, err = adopt_ffmpeg(pid, str(j.get('name', '')).strip())
+            if err:
+                return jsonify(error=err), 400
+            return jsonify(ok=True, msg=msg)
+        if op == 'include':
+            u = proc_unit(pid)
+            if not u or u == SELF_UNIT:
+                return jsonify(error='Procesul nu aparține unui serviciu'), 400
+            with CLOCK:
+                if u not in CFG['include_units']:
+                    CFG['include_units'].append(u)
+                if u in CFG['exclude_units']:
+                    CFG['exclude_units'].remove(u)
+                save_conf(CFG)
+            discover(True)
+            return jsonify(ok=True, msg='%s adăugat în panou' % u)
         procs = read_procs()
         if pid not in procs or not is_ffmpeg(procs[pid]):
             return jsonify(error='Procesul nu mai există sau nu e ffmpeg'), 404
@@ -1121,13 +1243,20 @@ function render(){if(!S)return;$('sys').innerHTML=sysChips(S.sys);const q=$('q')
  $('orph').innerHTML=S.orphans.length?`<h2>Alte procese ffmpeg (${S.orphans.length})</h2><div class="grid">`+S.orphans.map(f=>`<div class="card running"><div class="top"><span class="dot"></span><span class="nm">ffmpeg pid ${f.pid}</span>${f.unit?`<span class="tag">${esc(f.unit)}</span>`:''}</div>
  <div class="ff mono"><div class="io"><span>in:</span> ${esc(f.inp.join(' | '))}</div><div class="io"><span>out:</span> ${esc(f.out)}</div><div class="mu">${f.cpu}% CPU · ${hb(f.rss)} · ${hup(f.up)}</div></div>
  <details><summary class="mu">comandă completă</summary><div class="mono" style="word-break:break-all;font-size:12px">${esc(f.cmd)}</div></details>
- <div class="acts"><button class="btn r" onclick="killPid(${f.pid})">■ Oprește procesul</button></div></div>`).join('')+'</div>':''}
+ ${f.parent?`<div class="mu" style="font-size:12px;word-break:break-all">pornit de scriptul: <span class="mono">${esc(f.parent)}</span></div>`:''}
+ <div class="acts">${f.unit?`<button class="btn p" onclick="incUnit(${f.pid},'${esc(f.unit)}')">＋ Adaugă serviciul în panou</button>`:`<button class="btn p" onclick="adopt(${f.pid})">⚙ Salvează ca serviciu</button>`}
+ <button class="btn r" onclick="killPid(${f.pid})">■ Oprește procesul</button></div></div>`).join('')+'</div>':''}
 async function act(i,op){const it=S.items[i];
  const lbl={stop:'Opresc',restart:'Repornesc',mkservice:'Creez serviciu systemd (cu restart automat și pornire la boot) pentru',disable:'Scot de la pornirea la boot'}[op];
  if(lbl&&!confirm(`${lbl} „${it.name}”?`))return;
  document.querySelectorAll('.acts .btn').forEach(b=>b.disabled=true);
  try{const r=await api('/api/action',{kind:it.kind,id:it.id,op});toast(r.msg||'OK')}catch(e){if(e)toast(e.message,1)}
  setTimeout(()=>load(1),1200)}
+async function adopt(pid){const f=S.orphans.find(x=>x.pid===pid);if(!f)return;
+ const n=prompt('Nume serviciu (se va crea enc-NUME.service, cu restart automat și pornire la boot):',f.suggest);if(!n)return;
+ if(!confirm(`Creez enc-${n}.service cu exact această comandă ffmpeg, opresc procesul vechi${f.parent?' ȘI scriptul-buclă care îl pornește':''} și pornesc serviciul.\n\nStreamul se întrerupe câteva secunde. Continui?`))return;
+ toast('Se creează serviciul…');try{const r=await api('/api/action',{kind:'pid',id:pid,op:'adopt',name:n.trim()});toast(r.msg)}catch(e){if(e)toast(e.message,1)}setTimeout(()=>load(1),1500)}
+async function incUnit(pid,u){try{const r=await api('/api/action',{kind:'pid',id:pid,op:'include'});toast(r.msg);load(1)}catch(e){toast(e.message,1)}}
 async function killPid(pid){if(!confirm('Opresc procesul ffmpeg '+pid+'?'))return;try{const r=await api('/api/action',{kind:'pid',id:pid,op:'kill'});toast(r.msg)}catch(e){toast(e.message,1)}setTimeout(load,2500)}
 async function hide(i){const it=S.items[i];if(!confirm(`Ascund „${it.name}” din panou?`))return;try{const r=await api('/api/hide',{kind:it.kind,id:it.id});toast(r.msg);load(1)}catch(e){toast(e.message,1)}}
 function openLog(i){LG=S.items[i];$('lgT').textContent='Log · '+LG.name;$('lgB').textContent='Se încarcă…';$('lgS').innerHTML='';$('mLog').classList.add('on');loadLog(1);
